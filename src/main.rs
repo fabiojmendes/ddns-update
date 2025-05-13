@@ -14,7 +14,23 @@ use signal_hook::iterator::Signals;
 mod cloudflare;
 
 fn main() -> anyhow::Result<()> {
-    println!("DDNS monitoring service");
+    println!(
+        "DDNS monitoring service\nVersion {}, built for {} by {}.",
+        built_info::PKG_VERSION,
+        built_info::TARGET,
+        built_info::RUSTC_VERSION
+    );
+    if let (Some(version), Some(hash), Some(dirty)) = (
+        built_info::GIT_VERSION,
+        built_info::GIT_COMMIT_HASH_SHORT,
+        built_info::GIT_DIRTY,
+    ) {
+        println!("Git version: {version} ({hash})");
+        if dirty {
+            println!("Repo was dirty!");
+        }
+    }
+
     let cf_token = env::var("CF_TOKEN").expect("CF_TOKEN not set");
     let zone_id = env::var("ZONE_ID").expect("ZONE_ID not set");
     let iface = env::args().nth(1).expect("Interface parameter is needed");
@@ -70,4 +86,8 @@ fn main() -> anyhow::Result<()> {
 
     println!("Closing ddns-update");
     Ok(())
+}
+
+pub mod built_info {
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }

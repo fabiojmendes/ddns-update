@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
     let cf_token = env::var("CF_TOKEN").expect("CF_TOKEN not set");
     let zone_id = env::var("ZONE_ID").expect("ZONE_ID not set");
     let iface = env::args().nth(1).expect("Interface parameter is needed");
-    let fqdn = env::args().nth(2).expect("FQDN is required");
+    let domain_name = env::args().nth(2).expect("Domain Name is required");
 
     let cf_client = CloudflareClient::new(cf_token, zone_id)?;
 
@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    let re = Regex::new(r"^[0-9]+: \w+\s+inet6 ([a-f0-9:]+)/[0-9]+ scope global \\")
+    let re = Regex::new(r"^[0-9]+: \w+\s+inet6 ([a-f0-9:]+)/[0-9]+ scope global dynamic")
         .expect("failed to parse regex");
 
     let mut current_ip = None;
@@ -57,6 +57,8 @@ fn main() -> anyhow::Result<()> {
                 println!("Nothing to do");
             } else {
                 println!("Update ip in cloudflare");
+                let hostname = hostname::get()?;
+                let fqdn = format!("{}.{}", hostname.to_string_lossy(), domain_name);
                 retry(Exponential::from_millis(100).take(9), || {
                     cf_client.update(&ip, &fqdn)
                 })

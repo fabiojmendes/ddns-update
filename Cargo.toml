@@ -5,9 +5,10 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+hostname = "0.4"
 regex = "1"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-retry = "2.1.0"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+retry = "2.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = "0.3"

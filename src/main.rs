@@ -76,7 +76,9 @@ fn main() -> anyhow::Result<()> {
                 let hostname = hostname::get()?;
                 let fqdn = format!("{}.{}", hostname.to_string_lossy(), domain_name);
                 retry(Exponential::from_millis(100).take(9), || {
-                    cf_client.update(&ip, &fqdn)
+                    cf_client
+                        .update(&ip, &fqdn)
+                        .inspect_err(|e| eprintln!("Error updating cloudflare: {}", e))
                 })
                 .map_err(|e| anyhow::anyhow!(e))?;
                 current_ip = Some(ip);

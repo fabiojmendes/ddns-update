@@ -34,7 +34,7 @@ impl CloudflareClient {
             http_client,
         })
     }
-    pub fn update(&self, ip: &Ipv6Addr, fqdn: &str) -> anyhow::Result<()> {
+    pub fn update(&self, ip: &Ipv6Addr, fqdn: &str) -> anyhow::Result<Value> {
         let resp = self
             .http_client
             .get(self.base_url.clone())
@@ -68,8 +68,6 @@ impl CloudflareClient {
                     .error_for_status()?
             }
         };
-        let json = resp.json::<Value>()?;
-        println!("Body: {}", serde_json::to_string_pretty(&json)?);
-        Ok(())
+        Ok(resp.json::<Value>()?)
     }
 }

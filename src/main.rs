@@ -55,8 +55,10 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    let re = Regex::new(r"^[0-9]+: \w+\s+inet6 ([a-f0-9:]+)/[0-9]+ scope global dynamic")
-        .expect("failed to parse regex");
+    let re = Regex::new(
+        r"^[0-9]+: \w+\s+inet6 ([a-f0-9:]+)/[0-9]+ scope global (?:dynamic )?(?:noprefixroute )?\\",
+    )
+    .expect("failed to parse regex");
 
     let mut current_ip = None;
 
@@ -75,12 +77,13 @@ fn main() -> anyhow::Result<()> {
                 println!("Update ip in cloudflare");
                 let hostname = hostname::get()?;
                 let fqdn = format!("{}.{}", hostname.to_string_lossy(), domain_name);
-                retry(Exponential::from_millis(100).take(9), || {
+                let json = retry(Exponential::from_millis(100).take(9), || {
                     cf_client
                         .update(&ip, &fqdn)
-                        .inspect_err(|e| eprintln!("Error updating cloudflare: {}", e))
+                        .inspect_err(|e| println!("Error updating cloudflare: {:?}", e))
                 })
                 .map_err(|e| anyhow::anyhow!(e))?;
+                println!("Body: {}", serde_json::to_string_pretty(&json)?);
                 current_ip = Some(ip);
             }
         }

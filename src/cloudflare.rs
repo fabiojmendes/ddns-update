@@ -1,9 +1,9 @@
-use std::net::Ipv6Addr;
+use std::net::IpAddr;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use reqwest::{Url, blocking::Client};
+use reqwest::{Client, Url};
 
 #[derive(Debug, Deserialize)]
 struct CFReponse {
@@ -34,14 +34,15 @@ impl CloudflareClient {
             http_client,
         })
     }
-    pub fn update(&self, ip: &Ipv6Addr, fqdn: &str) -> anyhow::Result<Value> {
+    pub async fn update(&self, ip: &IpAddr, fqdn: &str) -> anyhow::Result<Value> {
         let resp = self
             .http_client
             .get(self.base_url.clone())
             .bearer_auth(&self.cf_token)
             .query(&[("name", fqdn), ("type", "AAAA")])
-            .send()?;
-        let cf_resp = resp.json::<CFReponse>()?;
+            .send()
+            .await?;
+        let cf_resp = resp.json::<CFReponse>().await?;
         let payload = json!({
             "type": "AAAA",
             "name": fqdn,
@@ -50,24 +51,26 @@ impl CloudflareClient {
         });
         let resp = match cf_resp.result.first() {
             Some(cf_host) => {
-                println!("Update existing record with id: {}", cf_host.id);
+                log::info!("Update existing record with id: {}", cf_host.id);
                 self.http_client
                     .put(self.base_url.join(&cf_host.id)?)
                     .bearer_auth(&self.cf_token)
                     .json(&payload)
-                    .send()?
+                    .send()
+                    .await?
                     .error_for_status()?
             }
             None => {
-                println!("Create new dns record");
+                log::info!("Create new dns record");
                 self.http_client
                     .post(self.base_url.clone())
                     .bearer_auth(&self.cf_token)
                     .json(&payload)
-                    .send()?
+                    .send()
+                    .await?
                     .error_for_status()?
             }
         };
-        Ok(resp.json::<Value>()?)
+        Ok(resp.json::<Value>().await?)
     }
 }

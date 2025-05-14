@@ -1,21 +1,52 @@
-use std::io::{BufRead, BufReader};
-use std::net::Ipv6Addr;
-use std::process::{Command, Stdio};
-use std::str::FromStr;
-use std::{env, thread};
+use std::{env, io::Write, time::Duration};
 
+use anyhow::bail;
 use cloudflare::CloudflareClient;
-use regex::Regex;
-use retry::delay::Exponential;
-use retry::retry;
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
+use futures::{
+    TryFutureExt,
+    stream::{StreamExt, TryStreamExt},
+};
+use log::Level;
+use netlink_sys::{AsyncSocket, SocketAddr};
+use rtnetlink::{
+    Handle,
+    constants::RTMGRP_IPV6_IFADDR,
+    packet_core::NetlinkPayload,
+    packet_route::{
+        RouteNetlinkMessage,
+        address::{AddressAttribute, AddressHeaderFlags, AddressScope},
+    },
+};
 
 mod cloudflare;
 
-fn main() -> anyhow::Result<()> {
-    println!(
-        "DDNS monitoring service\nVersion {}, built for {} by {}.",
+async fn get_link_index(handle: Handle, name: String) -> anyhow::Result<u32> {
+    log::info!("Looking for link: {}", name);
+    let mut links = handle.link().get().match_name(name).execute();
+    if let Some(link) = links.try_next().await? {
+        return Ok(link.header.index);
+    }
+    bail!("No link found")
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    env_logger::builder()
+        .format(|buf, record| {
+            let priority = match record.level() {
+                Level::Trace => 7,
+                Level::Debug => 7,
+                Level::Info => 6,
+                Level::Warn => 4,
+                Level::Error => 3,
+            };
+            writeln!(buf, "<{}>[{}]: {}", priority, record.level(), record.args())
+        })
+        .init();
+
+    log::info!("DDNS monitoring service");
+    log::info!(
+        "Version {}, built for {} by {}.",
         built_info::PKG_VERSION,
         built_info::TARGET,
         built_info::RUSTC_VERSION
@@ -25,12 +56,11 @@ fn main() -> anyhow::Result<()> {
         built_info::GIT_COMMIT_HASH_SHORT,
         built_info::GIT_DIRTY,
     ) {
-        println!("Git version: {version} ({hash})");
+        log::info!("Git version: {version} ({hash})");
         if dirty {
-            println!("Repo was dirty!");
+            log::warn!("Repo was dirty!");
         }
     }
-
     let cf_token = env::var("CF_TOKEN").expect("CF_TOKEN not set");
     let zone_id = env::var("ZONE_ID").expect("ZONE_ID not set");
     let iface = env::args().nth(1).expect("Interface parameter is needed");
@@ -38,58 +68,74 @@ fn main() -> anyhow::Result<()> {
 
     let cf_client = CloudflareClient::new(cf_token, zone_id)?;
 
-    let mut cmd = Command::new("ip")
-        .args(["-o", "-6", "monitor", "address", "dev", &iface])
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("error running ip monitor command");
+    // Open the netlink socket
+    let (mut connection, handle, mut messages) = rtnetlink::new_connection()?;
 
-    let stdout = cmd.stdout.take().expect("error getting stdout from child");
-    let stdout = BufReader::new(stdout);
+    // These flags specify what kinds of broadcast messages we want to listen for.
+    let mgroup_flags = RTMGRP_IPV6_IFADDR;
 
-    let mut signals = Signals::new([SIGINT, SIGTERM]).expect("Error creating signal hook");
-    thread::spawn(move || {
-        for _ in signals.forever() {
-            cmd.kill().expect("error killing ip command");
-            cmd.wait().expect("error waiting for ip command");
-        }
-    });
+    // A netlink socket address is created with said flags.
+    let addr = SocketAddr::new(0, mgroup_flags);
+    // Said address is bound so new conenctions and thus
+    // new message broadcasts can be received.
+    connection
+        .socket_mut()
+        .socket_mut()
+        .bind(&addr)
+        .expect("failed to bind");
+    tokio::spawn(connection);
 
-    let re = Regex::new(
-        r"^[0-9]+: \w+\s+inet6 ([a-f0-9:]+)/[0-9]+ scope global (?:dynamic )?(?:noprefixroute )?\\",
-    )
-    .expect("failed to parse regex");
+    let iface_index = get_link_index(handle, iface).await?;
 
     let mut current_ip = None;
 
-    for line in stdout.lines().map_while(Result::ok) {
-        println!("Input received:\n{}", line);
-        if let Some(ip_str) = re
-            .captures(&line)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str())
-        {
-            let ip = Ipv6Addr::from_str(ip_str)?;
-            println!("Parsed ip: {}", ip);
-            if current_ip.is_some_and(|c| c == ip) {
-                println!("Nothing to do");
-            } else {
-                println!("Update ip in cloudflare");
-                let hostname = hostname::get()?;
-                let fqdn = format!("{}.{}", hostname.to_string_lossy(), domain_name);
-                let json = retry(Exponential::from_millis(100).take(9), || {
-                    cf_client
-                        .update(&ip, &fqdn)
-                        .inspect_err(|e| println!("Error updating cloudflare: {:?}", e))
-                })
-                .map_err(|e| anyhow::anyhow!(e))?;
-                println!("Body: {}", serde_json::to_string_pretty(&json)?);
-                current_ip = Some(ip);
-            }
-        }
-    }
+    while let Some((message, _)) = messages.next().await {
+        let payload = message.payload;
+        if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewAddress(addr_msg)) = payload {
+            log::debug!("Header: {:?}", addr_msg.header);
+            log::debug!("Attributes: {:?}\n\n", addr_msg.attributes);
 
-    println!("Closing ddns-update");
+            if addr_msg.header.index != iface_index
+                || addr_msg.header.scope != AddressScope::Universe
+                || addr_msg
+                    .header
+                    .flags
+                    .contains(AddressHeaderFlags::Tentative)
+            {
+                log::debug!("Discard...");
+                continue;
+            }
+
+            let maybe_ip = addr_msg.attributes.into_iter().find_map(|attr| {
+                if let AddressAttribute::Address(addr) = attr {
+                    Some(addr)
+                } else {
+                    None
+                }
+            });
+            if let Some(ip) = maybe_ip {
+                if current_ip.is_some_and(|c| c == ip) {
+                    log::debug!("No ip change detected")
+                } else {
+                    log::info!("New ip {}", ip);
+                    let hostname = hostname::get()?;
+                    let fqdn = format!("{}.{}", hostname.to_string_lossy(), domain_name);
+                    let json = tryhard::retry_fn(|| {
+                        cf_client
+                            .update(&ip, &fqdn)
+                            .inspect_err(|e| log::warn!("{:?}", e))
+                    })
+                    .retries(10)
+                    .exponential_backoff(Duration::from_millis(50))
+                    .await?;
+                    log::info!("Body: {}", serde_json::to_string_pretty(&json)?);
+                    current_ip = Some(ip);
+                }
+            }
+        } else {
+            log::debug!("Payload not recognized: {:?}", payload);
+        };
+    }
     Ok(())
 }
 

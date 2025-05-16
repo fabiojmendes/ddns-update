@@ -1,4 +1,4 @@
-use std::{env, io::Write, time::Duration};
+use std::{env, time::Duration};
 
 use anyhow::bail;
 use cloudflare::CloudflareClient;
@@ -6,7 +6,6 @@ use futures::{
     TryFutureExt,
     stream::{StreamExt, TryStreamExt},
 };
-use log::Level;
 use netlink_sys::{AsyncSocket, SocketAddr};
 use rtnetlink::{
     Handle,
@@ -19,9 +18,9 @@ use rtnetlink::{
 };
 
 mod cloudflare;
+mod logging;
 
 async fn get_link_index(handle: Handle, name: String) -> anyhow::Result<u32> {
-    log::info!("Looking for link: {}", name);
     let mut links = handle.link().get().match_name(name).execute();
     if let Some(link) = links.try_next().await? {
         return Ok(link.header.index);
@@ -31,36 +30,8 @@ async fn get_link_index(handle: Handle, name: String) -> anyhow::Result<u32> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::builder()
-        .format(|buf, record| {
-            let priority = match record.level() {
-                Level::Trace => 7,
-                Level::Debug => 7,
-                Level::Info => 6,
-                Level::Warn => 4,
-                Level::Error => 3,
-            };
-            writeln!(buf, "<{}>[{}]: {}", priority, record.level(), record.args())
-        })
-        .init();
+    logging::init();
 
-    log::info!("DDNS monitoring service");
-    log::info!(
-        "Version {}, built for {} by {}.",
-        built_info::PKG_VERSION,
-        built_info::TARGET,
-        built_info::RUSTC_VERSION
-    );
-    if let (Some(version), Some(hash), Some(dirty)) = (
-        built_info::GIT_VERSION,
-        built_info::GIT_COMMIT_HASH_SHORT,
-        built_info::GIT_DIRTY,
-    ) {
-        log::info!("Git version: {version} ({hash})");
-        if dirty {
-            log::warn!("Repo was dirty!");
-        }
-    }
     let cf_token = env::var("CF_TOKEN").expect("CF_TOKEN not set");
     let zone_id = env::var("ZONE_ID").expect("ZONE_ID not set");
     let iface = env::args().nth(1).expect("Interface parameter is needed");
@@ -71,11 +42,8 @@ async fn main() -> anyhow::Result<()> {
     // Open the netlink socket
     let (mut connection, handle, mut messages) = rtnetlink::new_connection()?;
 
-    // These flags specify what kinds of broadcast messages we want to listen for.
-    let mgroup_flags = RTMGRP_IPV6_IFADDR;
-
     // A netlink socket address is created with said flags.
-    let addr = SocketAddr::new(0, mgroup_flags);
+    let addr = SocketAddr::new(0, RTMGRP_IPV6_IFADDR);
     // Said address is bound so new conenctions and thus
     // new message broadcasts can be received.
     connection
@@ -85,7 +53,8 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to bind");
     tokio::spawn(connection);
 
-    let iface_index = get_link_index(handle, iface).await?;
+    let iface_index = get_link_index(handle, iface.clone()).await?;
+    log::info!("Using interface {}: {}", iface_index, iface);
 
     let mut current_ip = None;
 
@@ -137,8 +106,4 @@ async fn main() -> anyhow::Result<()> {
         };
     }
     Ok(())
-}
-
-pub mod built_info {
-    include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }

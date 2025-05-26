@@ -68,3 +68,4 @@ jobs:
         with:
           executable-name: ddns-update
           target: ${{ matrix.platform.target }}
+          changes-file: ""
